@@ -1,0 +1,185 @@
+diff --git a/hw/xwayland/xwayland-cursor.c b/hw/xwayland/xwayland-cursor.c
+index 66720bcc0601d20143f7c32fcfa6597b48e0fb36..4eb9406526f8453e4a0698b2b0b935d330fccd33 100644
+--- a/hw/xwayland/xwayland-cursor.c
++++ b/hw/xwayland/xwayland-cursor.c
+@@ -28,6 +28,8 @@
+ 
+ #include <mipointer.h>
+ 
++#define DELAYED_X_CURSOR_TIMEOUT 5 /* ms */
++
+ static DevPrivateKeyRec xwl_cursor_private_key;
+ 
+ static void
+@@ -88,8 +90,12 @@ xwl_unrealize_cursor(DeviceIntPtr device, ScreenPtr screen, CursorPtr cursor)
+     /* When called from FreeCursor(), device is always NULL */
+     xwl_screen = xwl_screen_get(screen);
+     xorg_list_for_each_entry(xwl_seat, &xwl_screen->seat_list, link) {
+-        if (cursor == xwl_seat->x_cursor)
++        if (cursor == xwl_seat->x_cursor) {
++            if (xwl_seat->x_cursor == xwl_seat->pending_x_cursor)
++                xwl_seat->pending_x_cursor = NULL;
++
+             xwl_seat->x_cursor = NULL;
++        }
+     }
+ 
+     return xwl_shm_destroy_pixmap(pixmap);
+@@ -227,36 +233,120 @@ xwl_tablet_tool_set_cursor(struct xwl_tablet_tool *xwl_tablet_tool)
+     wl_surface_commit(xwl_cursor->surface);
+ }
+ 
++static void
++xwl_seat_update_cursor(struct xwl_seat *xwl_seat)
++{
++    struct xwl_tablet_tool *xwl_tablet_tool;
++
++    xwl_seat_set_cursor(xwl_seat);
++
++    xorg_list_for_each_entry(xwl_tablet_tool, &xwl_seat->tablet_tools, link) {
++        if (xwl_tablet_tool->proximity_in_serial != 0)
++            xwl_tablet_tool_set_cursor(xwl_tablet_tool);
++    }
++
++    /* Clear delayed cursor if any */
++    xwl_seat->pending_x_cursor = NULL;
++}
++
++static void
++xwl_seat_update_cursor_visibility(struct xwl_seat *xwl_seat)
++{
++    xwl_seat->x_cursor = xwl_seat->pending_x_cursor;
++    xwl_seat_cursor_visibility_changed(xwl_seat);
++    xwl_seat_update_cursor(xwl_seat);
++}
++
++static void
++xwl_set_cursor_cancel_delay(struct xwl_seat *xwl_seat)
++{
++    if (!xwl_seat->x_cursor_timer)
++        return;
++
++    TimerCancel(xwl_seat->x_cursor_timer);
++}
++
++static void
++xwl_set_cursor_free_timer(struct xwl_seat *xwl_seat)
++{
++    if (!xwl_seat->x_cursor_timer)
++        return;
++
++    TimerFree(xwl_seat->x_cursor_timer);
++    xwl_seat->x_cursor_timer = NULL;
++}
++
++static CARD32
++xwl_set_cursor_timer_callback(OsTimerPtr timer, CARD32 time, void *arg)
++{
++    struct xwl_seat *xwl_seat = arg;
++
++    xwl_set_cursor_cancel_delay(xwl_seat);
++    xwl_seat_update_cursor_visibility(xwl_seat);
++
++    /* Don't re-arm the timer */
++    return 0;
++}
++
++static void
++xwl_set_cursor_delayed(struct xwl_seat *xwl_seat, CursorPtr cursor)
++{
++    xwl_seat->pending_x_cursor = cursor;
++
++    xwl_seat->x_cursor_timer =
++        TimerSet(xwl_seat->x_cursor_timer,
++                 0, DELAYED_X_CURSOR_TIMEOUT,
++                 &xwl_set_cursor_timer_callback,
++                 xwl_seat);
++}
++
+ static void
+ xwl_set_cursor(DeviceIntPtr device,
+                ScreenPtr screen, CursorPtr cursor, int x, int y)
+ {
+     struct xwl_seat *xwl_seat;
+-    struct xwl_tablet_tool *xwl_tablet_tool;
+     Bool cursor_visibility_changed;
+ 
+     xwl_seat = device->public.devicePrivate;
+     if (xwl_seat == NULL)
+         return;
+ 
+-    cursor_visibility_changed = !!xwl_seat->x_cursor ^ !!cursor;
+-
+-    xwl_seat->x_cursor = cursor;
++    xwl_set_cursor_cancel_delay(xwl_seat);
+ 
+-    if (cursor_visibility_changed)
+-        xwl_seat_cursor_visibility_changed(xwl_seat);
++    cursor_visibility_changed = !!xwl_seat->x_cursor ^ !!cursor;
+ 
+-    xwl_seat_set_cursor(xwl_seat);
++    if (!cursor_visibility_changed) {
++        /* Cursor remains shown or hidden, apply the change immediately */
++        xwl_seat->x_cursor = cursor;
++        xwl_seat_update_cursor(xwl_seat);
++        return;
++    }
+ 
+-    xorg_list_for_each_entry(xwl_tablet_tool, &xwl_seat->tablet_tools, link) {
+-        if (xwl_tablet_tool->proximity_in_serial != 0)
+-            xwl_tablet_tool_set_cursor(xwl_tablet_tool);
++    xwl_seat->pending_x_cursor = cursor;
++    if (!xwl_seat->pending_x_cursor) {
++        /* Cursor is being hidden, apply the change immediately */
++        xwl_seat_update_cursor_visibility(xwl_seat);
++    } else {
++        /* Cursor is being shown, delay the change until moved or timed out */
++        xwl_set_cursor_delayed(xwl_seat, cursor);
+     }
+ }
+ 
+ static void
+ xwl_move_cursor(DeviceIntPtr device, ScreenPtr screen, int x, int y)
+ {
++    struct xwl_seat *xwl_seat;
++
++    xwl_seat = device->public.devicePrivate;
++    if (xwl_seat == NULL)
++        return;
++
++    xwl_set_cursor_cancel_delay(xwl_seat);
++
++    if (!xwl_seat->pending_x_cursor)
++        return;
++
++    xwl_seat_update_cursor_visibility(xwl_seat);
+ }
+ 
+ static Bool
+@@ -268,6 +358,13 @@ xwl_device_cursor_initialize(DeviceIntPtr device, ScreenPtr screen)
+ static void
+ xwl_device_cursor_cleanup(DeviceIntPtr device, ScreenPtr screen)
+ {
++    struct xwl_seat *xwl_seat;
++
++    xwl_seat = device->public.devicePrivate;
++    if (xwl_seat == NULL)
++        return;
++
++    xwl_set_cursor_free_timer(xwl_seat);
+ }
+ 
+ static miPointerSpriteFuncRec xwl_pointer_sprite_funcs = {
+diff --git a/hw/xwayland/xwayland.h b/hw/xwayland/xwayland.h
+index b9495b313e50896f70dbaee1ad426d3a99ed22ff..15f4db86e6302c3ee0301388d0273082f7d9c1c4 100644
+--- a/hw/xwayland/xwayland.h
++++ b/hw/xwayland/xwayland.h
+@@ -265,6 +265,8 @@ struct xwl_seat {
+     uint32_t pointer_enter_serial;
+     struct xorg_list link;
+     CursorPtr x_cursor;
++    OsTimerPtr x_cursor_timer;
++    CursorPtr pending_x_cursor;
+     struct xwl_cursor cursor;
+     WindowPtr last_xwindow;
+ 
